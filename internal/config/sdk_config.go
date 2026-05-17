@@ -38,6 +38,10 @@ type SDKConfig struct {
 	// Default is false (disabled).
 	PassthroughHeaders bool `yaml:"passthrough-headers" json:"passthrough-headers"`
 
+	// NativePassthrough enables native API surface passthrough routing.
+	// Default is false (disabled).
+	NativePassthrough bool `yaml:"native-passthrough" json:"native-passthrough"`
+
 	// Streaming configures server-side streaming behavior (keep-alives and safe bootstrap retries).
 	Streaming StreamingConfig `yaml:"streaming" json:"streaming"`
 

@@ -188,6 +188,17 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 	}
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	if handlers.NativePassthroughEnabled(h.Cfg) {
+		body, status, upstreamHeaders, errMsg := h.ExecuteNativePassthroughStream(cliCtx, h.HandlerType(), modelName, rawJSON)
+		if errMsg != nil {
+			h.WriteErrorResponse(c, errMsg)
+			cliCancel(errMsg.Error)
+			return
+		}
+		errCopy := h.WriteNativePassthroughStreamResponse(c, status, body, upstreamHeaders, flusher)
+		cliCancel(errCopy)
+		return
+	}
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, alt)
 
 	setSSEHeaders := func() {
@@ -288,6 +299,17 @@ func (h *GeminiAPIHandler) handleGenerateContent(c *gin.Context, modelName strin
 	c.Header("Content-Type", "application/json")
 	alt := h.GetAlt(c)
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	if handlers.NativePassthroughEnabled(h.Cfg) {
+		resp, status, upstreamHeaders, errMsg := h.ExecuteNativePassthrough(cliCtx, h.HandlerType(), modelName, rawJSON)
+		if errMsg != nil {
+			h.WriteErrorResponse(c, errMsg)
+			cliCancel(errMsg.Error)
+			return
+		}
+		h.WriteNativePassthroughResponse(c, status, resp, upstreamHeaders)
+		cliCancel()
+		return
+	}
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, alt)
 	stopKeepAlive()

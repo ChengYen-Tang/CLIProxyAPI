@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/passthrough"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -194,6 +196,11 @@ func PassthroughHeadersEnabled(cfg *config.SDKConfig) bool {
 	return cfg != nil && cfg.PassthroughHeaders
 }
 
+// NativePassthroughEnabled returns whether native raw forwarding is enabled.
+func NativePassthroughEnabled(cfg *config.SDKConfig) bool {
+	return cfg != nil && cfg.NativePassthrough
+}
+
 func requestExecutionMetadata(ctx context.Context) map[string]any {
 	// Idempotency-Key is an optional client-supplied header used to correlate retries.
 	// Only include it if the client explicitly provides it.
@@ -229,6 +236,14 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 		meta[coreexecutor.DisallowFreeAuthMetadataKey] = true
 	}
 	return meta
+}
+
+func ginContextFromContext(ctx context.Context) *gin.Context {
+	if ctx == nil {
+		return nil
+	}
+	ginCtx, _ := ctx.Value("gin").(*gin.Context)
+	return ginCtx
 }
 
 // headersFromContext extracts the original HTTP request headers from the gin context
@@ -625,6 +640,128 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		return resp.Payload, nil, nil
 	}
 	return resp.Payload, FilterUpstreamHeaders(resp.Headers), nil
+}
+
+// ExecuteNativePassthrough forwards a non-streaming request without translating its body.
+func (h *BaseAPIHandler) ExecuteNativePassthrough(ctx context.Context, surface, modelName string, rawJSON []byte) ([]byte, int, http.Header, *interfaces.ErrorMessage) {
+	if h == nil || h.AuthManager == nil {
+		return nil, 0, nil, &interfaces.ErrorMessage{
+			StatusCode: http.StatusServiceUnavailable,
+			Error:      fmt.Errorf("auth manager is not available"),
+		}
+	}
+
+	reqMeta := requestExecutionMetadata(ctx)
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
+
+	method := http.MethodPost
+	path := ""
+	rawQuery := ""
+	headers := headersFromContext(ctx)
+	if ginCtx := ginContextFromContext(ctx); ginCtx != nil && ginCtx.Request != nil {
+		method = ginCtx.Request.Method
+		if ginCtx.Request.URL != nil {
+			path = ginCtx.Request.URL.Path
+			rawQuery = ginCtx.Request.URL.RawQuery
+		}
+	}
+
+	resp, err := passthrough.Execute(ctx, h.AuthManager, passthrough.Request{
+		Surface:  surface,
+		Model:    modelName,
+		Method:   method,
+		Path:     path,
+		RawQuery: rawQuery,
+		Body:     rawJSON,
+		Headers:  headers,
+		Metadata: reqMeta,
+	})
+	if err != nil {
+		err = enrichAuthSelectionError(err, passthrough.FilterProviders(surface, passthrough.ProvidersForSurface(surface)), modelName)
+		status := http.StatusInternalServerError
+		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
+			if code := se.StatusCode(); code > 0 {
+				status = code
+			}
+		}
+		var addon http.Header
+		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
+			if hdr := he.Headers(); hdr != nil {
+				addon = hdr.Clone()
+			}
+		}
+		return nil, 0, nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
+	}
+
+	status := resp.StatusCode
+	if status <= 0 {
+		status = http.StatusOK
+	}
+	if !PassthroughHeadersEnabled(h.Cfg) {
+		return resp.Body, status, nil, nil
+	}
+	return resp.Body, status, FilterUpstreamHeaders(resp.Headers), nil
+}
+
+// ExecuteNativePassthroughStream forwards a streaming request without translating chunks.
+func (h *BaseAPIHandler) ExecuteNativePassthroughStream(ctx context.Context, surface, modelName string, rawJSON []byte) (io.ReadCloser, int, http.Header, *interfaces.ErrorMessage) {
+	if h == nil || h.AuthManager == nil {
+		return nil, 0, nil, &interfaces.ErrorMessage{
+			StatusCode: http.StatusServiceUnavailable,
+			Error:      fmt.Errorf("auth manager is not available"),
+		}
+	}
+
+	reqMeta := requestExecutionMetadata(ctx)
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
+
+	method := http.MethodPost
+	path := ""
+	rawQuery := ""
+	headers := headersFromContext(ctx)
+	if ginCtx := ginContextFromContext(ctx); ginCtx != nil && ginCtx.Request != nil {
+		method = ginCtx.Request.Method
+		if ginCtx.Request.URL != nil {
+			path = ginCtx.Request.URL.Path
+			rawQuery = ginCtx.Request.URL.RawQuery
+		}
+	}
+
+	resp, err := passthrough.ExecuteStream(ctx, h.AuthManager, passthrough.Request{
+		Surface:  surface,
+		Model:    modelName,
+		Method:   method,
+		Path:     path,
+		RawQuery: rawQuery,
+		Body:     rawJSON,
+		Headers:  headers,
+		Metadata: reqMeta,
+	})
+	if err != nil {
+		err = enrichAuthSelectionError(err, passthrough.FilterProviders(surface, passthrough.ProvidersForSurface(surface)), modelName)
+		status := http.StatusInternalServerError
+		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
+			if code := se.StatusCode(); code > 0 {
+				status = code
+			}
+		}
+		var addon http.Header
+		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
+			if hdr := he.Headers(); hdr != nil {
+				addon = hdr.Clone()
+			}
+		}
+		return nil, 0, nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
+	}
+
+	status := resp.StatusCode
+	if status <= 0 {
+		status = http.StatusOK
+	}
+	if !PassthroughHeadersEnabled(h.Cfg) {
+		return resp.Body, status, nil, nil
+	}
+	return resp.Body, status, FilterUpstreamHeaders(resp.Headers), nil
 }
 
 // ExecuteStreamWithAuthManager executes a streaming request via the core auth manager.
@@ -1026,6 +1163,51 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 	}
 	c.Status(status)
 	_, _ = c.Writer.Write(body)
+}
+
+// WriteNativePassthroughResponse writes a raw upstream response returned by native passthrough.
+func (h *BaseAPIHandler) WriteNativePassthroughResponse(c *gin.Context, status int, body []byte, upstreamHeaders http.Header) {
+	if status <= 0 {
+		status = http.StatusOK
+	}
+	WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+	c.Status(status)
+	_, _ = c.Writer.Write(body)
+	appendAPIResponse(c, body)
+}
+
+// WriteNativePassthroughStreamResponse writes a raw upstream stream without chunk conversion.
+func (h *BaseAPIHandler) WriteNativePassthroughStreamResponse(c *gin.Context, status int, body io.ReadCloser, upstreamHeaders http.Header, flusher http.Flusher) error {
+	if body == nil {
+		return fmt.Errorf("native passthrough stream body is nil")
+	}
+	defer func() {
+		_ = body.Close()
+	}()
+	if status <= 0 {
+		status = http.StatusOK
+	}
+	WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+	c.Status(status)
+	buf := make([]byte, 32*1024)
+	for {
+		n, errRead := body.Read(buf)
+		if n > 0 {
+			if _, errWrite := c.Writer.Write(buf[:n]); errWrite != nil {
+				return errWrite
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if errRead == nil {
+			continue
+		}
+		if errRead == io.EOF {
+			return nil
+		}
+		return errRead
+	}
 }
 
 func (h *BaseAPIHandler) LoggingAPIResponseError(ctx context.Context, err *interfaces.ErrorMessage) {

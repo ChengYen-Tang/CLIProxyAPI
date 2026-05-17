@@ -108,6 +108,15 @@ type Result struct {
 	Error *Error
 }
 
+// Selection captures the credential and executor selected for a request.
+type Selection struct {
+	Auth     *Auth
+	Provider string
+}
+
+// HTTPSelectionFunc executes an HTTP request with a selected credential.
+type HTTPSelectionFunc func(ctx context.Context, selection *Selection) (*http.Response, error)
+
 // Selector chooses an auth candidate for execution.
 type Selector interface {
 	Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error)
@@ -1316,6 +1325,304 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		return nil, lastErr
 	}
 	return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+}
+
+// Select chooses the next credential and executor without executing a request.
+func (m *Manager) Select(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Selection, error) {
+	if m == nil {
+		return nil, &Error{Code: "auth_not_found", Message: "manager is nil"}
+	}
+	auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, model, opts, tried)
+	if errPick != nil {
+		return nil, errPick
+	}
+	if auth == nil {
+		return nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+	}
+	if executor == nil {
+		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
+	}
+	return &Selection{
+		Auth:     auth,
+		Provider: provider,
+	}, nil
+}
+
+// ExecuteSelectedHTTP selects credentials and executes an HTTP callback with existing retry/cooldown behavior.
+func (m *Manager) ExecuteSelectedHTTP(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, execute HTTPSelectionFunc) (*http.Response, *Selection, error) {
+	if m == nil {
+		return nil, nil, &Error{Code: "auth_not_found", Message: "manager is nil"}
+	}
+	if execute == nil {
+		return nil, nil, &Error{Code: "invalid_request", Message: "http execute callback is nil"}
+	}
+	normalized := m.normalizeProviders(providers)
+	if len(normalized) == 0 {
+		return nil, nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
+	}
+
+	_, maxRetryCredentials, maxWait := m.retrySettings()
+	homeMode := m.HomeEnabled()
+	homeProviderMismatchLimit := homeProviderMismatchRetryLimit(maxRetryCredentials)
+
+	var lastErr error
+	var lastResp *http.Response
+	var lastSelection *Selection
+	for attempt := 0; ; attempt++ {
+		tried := make(map[string]struct{})
+		attempted := make(map[string]struct{})
+		homeAuthCount := 1
+		for {
+			if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
+				break
+			}
+			pickOpts := opts
+			if homeMode {
+				pickOpts = withHomeAuthCount(opts, homeAuthCount)
+			}
+			selection, errSelect := m.selectForHTTP(ctx, normalized, model, pickOpts, tried)
+			if errSelect != nil {
+				if homeMode && isProviderNotAllowedError(errSelect) {
+					lastErr = errSelect
+					if homeAuthCount >= homeProviderMismatchLimit {
+						break
+					}
+					homeAuthCount++
+					continue
+				}
+				if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errSelect) {
+					if lastResp != nil {
+						return lastResp, lastSelection, nil
+					}
+					return nil, nil, lastErr
+				}
+				if lastErr != nil {
+					break
+				}
+				return nil, nil, errSelect
+			}
+			if selection == nil || selection.Auth == nil {
+				lastErr = &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+				break
+			}
+
+			tried[selection.Auth.ID] = struct{}{}
+			attempted[selection.Auth.ID] = struct{}{}
+			publishSelectedAuthMetadata(opts.Metadata, selection.Auth.ID)
+
+			execCtx := ctx
+			if rt := m.roundTripperFor(selection.Auth); rt != nil {
+				execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
+				execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
+			}
+			execCtx = contextWithRequestedModelAlias(execCtx, opts, model)
+
+			resp, errExecute := execute(execCtx, selection)
+			if errExecute != nil {
+				closeHTTPResponseBody(resp)
+				closeHTTPResponseBody(lastResp)
+				lastResp = nil
+				lastSelection = nil
+				if errCtx := execCtx.Err(); errCtx != nil {
+					return nil, nil, errCtx
+				}
+				result := Result{
+					AuthID:   selection.Auth.ID,
+					Provider: selection.Provider,
+					Model:    model,
+					Success:  false,
+					Error:    &Error{Message: errExecute.Error()},
+				}
+				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExecute); ok && se != nil {
+					result.Error.HTTPStatus = se.StatusCode()
+				}
+				if ra := retryAfterFromError(errExecute); ra != nil {
+					result.RetryAfter = ra
+				}
+				m.MarkResult(execCtx, result)
+				if isRequestInvalidError(errExecute) {
+					return nil, nil, errExecute
+				}
+				lastErr = errExecute
+				if homeMode {
+					homeAuthCount++
+				}
+				continue
+			}
+			if resp == nil {
+				lastErr = &Error{Code: "invalid_response", Message: "http execute callback returned nil response"}
+				if homeMode {
+					homeAuthCount++
+				}
+				continue
+			}
+
+			status := resp.StatusCode
+			if status >= http.StatusBadRequest {
+				m.MarkResult(execCtx, Result{
+					AuthID:   selection.Auth.ID,
+					Provider: selection.Provider,
+					Model:    model,
+					Success:  false,
+					Error: &Error{
+						Message:    http.StatusText(status),
+						HTTPStatus: status,
+					},
+					RetryAfter: retryAfterFromHTTPHeader(resp.Header),
+				})
+			}
+			if status < http.StatusBadRequest || isRequestInvalidHTTPStatus(status) {
+				return resp, selection, nil
+			}
+
+			lastErr = httpStatusError{status: status, retryAfter: retryAfterFromHTTPHeader(resp.Header)}
+			closeHTTPResponseBody(lastResp)
+			lastResp = nil
+			lastSelection = nil
+			bufferedResp, errBuffer := bufferHTTPResponseBody(resp)
+			if errBuffer != nil {
+				lastErr = errBuffer
+			} else {
+				lastResp = bufferedResp
+				lastSelection = selection
+			}
+			if homeMode {
+				homeAuthCount++
+			}
+		}
+
+		wait, shouldRetry := m.shouldRetryAfterError(lastErr, attempt, normalized, model, maxWait)
+		if !shouldRetry {
+			break
+		}
+		closeHTTPResponseBody(lastResp)
+		lastResp = nil
+		lastSelection = nil
+		if errWait := waitForCooldown(ctx, wait); errWait != nil {
+			return nil, nil, errWait
+		}
+	}
+	if lastResp != nil {
+		return lastResp, lastSelection, nil
+	}
+	if lastErr != nil {
+		return nil, nil, lastErr
+	}
+	return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+}
+
+func (m *Manager) selectForHTTP(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Selection, error) {
+	if m.HomeEnabled() {
+		return m.selectViaHomeForProviders(ctx, providers, model, opts, tried)
+	}
+	return m.Select(ctx, providers, model, opts, tried)
+}
+
+func (m *Manager) selectViaHomeForProviders(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Selection, error) {
+	auth, _, provider, err := m.pickNextViaHome(ctx, model, opts, tried)
+	if err != nil {
+		return nil, err
+	}
+	if !providerAllowed(provider, providers) {
+		if auth != nil && tried != nil {
+			tried[auth.ID] = struct{}{}
+		}
+		return nil, &Error{Code: providerNotAllowedErrorCode, Message: "home returned auth outside requested provider allowlist", HTTPStatus: http.StatusNotFound}
+	}
+	return &Selection{
+		Auth:     auth,
+		Provider: provider,
+	}, nil
+}
+
+const providerNotAllowedErrorCode = "provider_not_allowed"
+const defaultHomeProviderMismatchRetryLimit = 32
+
+func homeProviderMismatchRetryLimit(maxRetryCredentials int) int {
+	if maxRetryCredentials > 0 {
+		return maxRetryCredentials
+	}
+	return defaultHomeProviderMismatchRetryLimit
+}
+
+func isProviderNotAllowedError(err error) bool {
+	var authErr *Error
+	if !errors.As(err, &authErr) || authErr == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(authErr.Code), providerNotAllowedErrorCode)
+}
+
+func bufferHTTPResponseBody(resp *http.Response) (*http.Response, error) {
+	if resp == nil {
+		return nil, nil
+	}
+	buffered := new(http.Response)
+	*buffered = *resp
+	buffered.Header = resp.Header.Clone()
+	var body []byte
+	if resp.Body != nil {
+		var errRead error
+		body, errRead = io.ReadAll(resp.Body)
+		if errClose := resp.Body.Close(); errRead == nil && errClose != nil {
+			errRead = errClose
+		}
+		if errRead != nil {
+			return nil, errRead
+		}
+	}
+	buffered.Body = io.NopCloser(bytes.NewReader(body))
+	buffered.ContentLength = int64(len(body))
+	return buffered, nil
+}
+
+func closeHTTPResponseBody(resp *http.Response) {
+	if resp == nil || resp.Body == nil {
+		return
+	}
+	_ = resp.Body.Close()
+}
+
+type httpStatusError struct {
+	status     int
+	retryAfter *time.Duration
+}
+
+func (e httpStatusError) Error() string {
+	if text := http.StatusText(e.status); text != "" {
+		return text
+	}
+	return "upstream http error"
+}
+
+func (e httpStatusError) StatusCode() int { return e.status }
+
+func (e httpStatusError) RetryAfter() *time.Duration { return e.retryAfter }
+
+func retryAfterFromHTTPHeader(headers http.Header) *time.Duration {
+	if headers == nil {
+		return nil
+	}
+	value := strings.TrimSpace(headers.Get("Retry-After"))
+	if value == "" {
+		return nil
+	}
+	if seconds, err := strconv.Atoi(value); err == nil {
+		duration := time.Duration(seconds) * time.Second
+		return &duration
+	}
+	if when, err := http.ParseTime(value); err == nil {
+		duration := time.Until(when)
+		if duration < 0 {
+			duration = 0
+		}
+		return &duration
+	}
+	return nil
+}
+
+func isRequestInvalidHTTPStatus(status int) bool {
+	return status == http.StatusBadRequest || status == http.StatusNotFound
 }
 
 func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int) (cliproxyexecutor.Response, error) {
@@ -3176,6 +3483,19 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		}
 		return authCopy, executor, providerKey, nil
 	}
+}
+
+func providerAllowed(provider string, providers []string) bool {
+	provider = strings.TrimSpace(strings.ToLower(provider))
+	if provider == "" {
+		return false
+	}
+	for _, candidate := range providers {
+		if provider == strings.TrimSpace(strings.ToLower(candidate)) {
+			return true
+		}
+	}
+	return false
 }
 
 type homeErrorEnvelope struct {

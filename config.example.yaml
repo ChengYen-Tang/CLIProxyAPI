@@ -102,6 +102,10 @@ force-model-prefix: false
 # Default is false (disabled).
 passthrough-headers: false
 
+# When true, route supported API surfaces through the native passthrough pipeline.
+# Default is false (disabled).
+native-passthrough: false
+
 # Number of times to retry a request. Retries will occur if the HTTP response code is 403, 408, 500, 502, 503, or 504.
 request-retry: 3
 

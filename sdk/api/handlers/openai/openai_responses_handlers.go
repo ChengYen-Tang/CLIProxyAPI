@@ -414,6 +414,20 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 		})
 		return
 	}
+	if handlers.NativePassthroughEnabled(h.Cfg) {
+		c.Header("Content-Type", "application/json")
+		modelName := gjson.GetBytes(rawJSON, "model").String()
+		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+		resp, status, upstreamHeaders, errMsg := h.ExecuteNativePassthrough(cliCtx, h.HandlerType(), modelName, rawJSON)
+		if errMsg != nil {
+			h.WriteErrorResponse(c, errMsg)
+			cliCancel(errMsg.Error)
+			return
+		}
+		h.WriteNativePassthroughResponse(c, status, resp, upstreamHeaders)
+		cliCancel()
+		return
+	}
 	if streamResult.Exists() {
 		if updated, err := sjson.DeleteBytes(rawJSON, "stream"); err == nil {
 			rawJSON = updated
@@ -448,8 +462,20 @@ func (h *OpenAIResponsesAPIHandler) handleNonStreamingResponse(c *gin.Context, r
 
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 
+	if handlers.NativePassthroughEnabled(h.Cfg) {
+		resp, status, upstreamHeaders, errMsg := h.ExecuteNativePassthrough(cliCtx, h.HandlerType(), modelName, rawJSON)
+		if errMsg != nil {
+			h.WriteErrorResponse(c, errMsg)
+			cliCancel(errMsg.Error)
+			return
+		}
+		h.WriteNativePassthroughResponse(c, status, resp, upstreamHeaders)
+		cliCancel()
+		return
+	}
+
+	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 	stopKeepAlive()
 	if errMsg != nil {
@@ -485,6 +511,17 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	// New core execution path
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	if handlers.NativePassthroughEnabled(h.Cfg) {
+		body, status, upstreamHeaders, errMsg := h.ExecuteNativePassthroughStream(cliCtx, h.HandlerType(), modelName, rawJSON)
+		if errMsg != nil {
+			h.WriteErrorResponse(c, errMsg)
+			cliCancel(errMsg.Error)
+			return
+		}
+		errCopy := h.WriteNativePassthroughStreamResponse(c, status, body, upstreamHeaders, flusher)
+		cliCancel(errCopy)
+		return
+	}
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 
 	setSSEHeaders := func() {

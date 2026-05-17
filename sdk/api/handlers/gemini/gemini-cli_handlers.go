@@ -176,6 +176,17 @@ func (h *GeminiCLIAPIHandler) handleInternalStreamGenerateContent(c *gin.Context
 	modelName := modelResult.String()
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	if handlers.NativePassthroughEnabled(h.Cfg) {
+		body, status, upstreamHeaders, errMsg := h.ExecuteNativePassthroughStream(cliCtx, h.HandlerType(), modelName, rawJSON)
+		if errMsg != nil {
+			h.WriteErrorResponse(c, errMsg)
+			cliCancel(errMsg.Error)
+			return
+		}
+		errCopy := h.WriteNativePassthroughStreamResponse(c, status, body, upstreamHeaders, flusher)
+		cliCancel(errCopy)
+		return
+	}
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 	h.forwardCLIStream(c, flusher, "", func(err error) { cliCancel(err) }, dataChan, errChan)
@@ -190,6 +201,17 @@ func (h *GeminiCLIAPIHandler) handleInternalGenerateContent(c *gin.Context, rawJ
 	modelName := modelResult.String()
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	if handlers.NativePassthroughEnabled(h.Cfg) {
+		resp, status, upstreamHeaders, errMsg := h.ExecuteNativePassthrough(cliCtx, h.HandlerType(), modelName, rawJSON)
+		if errMsg != nil {
+			h.WriteErrorResponse(c, errMsg)
+			cliCancel(errMsg.Error)
+			return
+		}
+		h.WriteNativePassthroughResponse(c, status, resp, upstreamHeaders)
+		cliCancel()
+		return
+	}
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 	if errMsg != nil {
 		h.WriteErrorResponse(c, errMsg)
