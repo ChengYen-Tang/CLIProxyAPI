@@ -84,66 +84,7 @@ func (h *GeminiCLIAPIHandler) CLIHandler(c *gin.Context) {
 	} else if requestRawURI == "/v1internal:streamGenerateContent" {
 		h.handleInternalStreamGenerateContent(c, rawJSON)
 	} else {
-		reqBody := bytes.NewBuffer(rawJSON)
-		req, err := http.NewRequest("POST", fmt.Sprintf("https://cloudcode-pa.googleapis.com%s", c.Request.URL.RequestURI()), reqBody)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
-				Error: handlers.ErrorDetail{
-					Message: fmt.Sprintf("Invalid request: %v", err),
-					Type:    "invalid_request_error",
-				},
-			})
-			return
-		}
-		for key, value := range c.Request.Header {
-			req.Header[key] = value
-		}
-
-		httpClient := util.SetProxy(h.Cfg, &http.Client{})
-
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
-				Error: handlers.ErrorDetail{
-					Message: fmt.Sprintf("Invalid request: %v", err),
-					Type:    "invalid_request_error",
-				},
-			})
-			return
-		}
-
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			defer func() {
-				if err = resp.Body.Close(); err != nil {
-					log.Printf("warn: failed to close response body: %v", err)
-				}
-			}()
-			bodyBytes, _ := io.ReadAll(resp.Body)
-
-			c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
-				Error: handlers.ErrorDetail{
-					Message: string(bodyBytes),
-					Type:    "invalid_request_error",
-				},
-			})
-			return
-		}
-
-		defer func() {
-			_ = resp.Body.Close()
-		}()
-
-		for key, value := range resp.Header {
-			c.Header(key, value[0])
-		}
-		output, err := io.ReadAll(resp.Body)
-		if err != nil {
-			log.Errorf("Failed to read response body: %v", err)
-			return
-		}
-		c.Set("API_RESPONSE_TIMESTAMP", time.Now())
-		_, _ = c.Writer.Write(output)
-		c.Set("API_RESPONSE", output)
+		h.handleGenericInternalRequest(c, rawJSON)
 	}
 }
 
@@ -221,6 +162,85 @@ func (h *GeminiCLIAPIHandler) handleInternalGenerateContent(c *gin.Context, rawJ
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 	_, _ = c.Writer.Write(resp)
 	cliCancel()
+}
+
+func (h *GeminiCLIAPIHandler) handleGenericInternalRequest(c *gin.Context, rawJSON []byte) {
+	if !handlers.NativePassthroughEnabled(h.Cfg) {
+		h.forwardGenericInternalRequest(c, rawJSON)
+		return
+	}
+	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	resp, status, upstreamHeaders, errMsg := h.ExecuteNativePassthrough(cliCtx, h.HandlerType(), "", rawJSON)
+	if errMsg != nil {
+		h.WriteErrorResponse(c, errMsg)
+		cliCancel(errMsg.Error)
+		return
+	}
+	h.WriteNativePassthroughResponse(c, status, resp, upstreamHeaders)
+	cliCancel()
+}
+
+func (h *GeminiCLIAPIHandler) forwardGenericInternalRequest(c *gin.Context, rawJSON []byte) {
+	reqBody := bytes.NewBuffer(rawJSON)
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("https://cloudcode-pa.googleapis.com%s", c.Request.URL.RequestURI()), reqBody)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: fmt.Sprintf("Invalid request: %v", err),
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
+	for key, value := range c.Request.Header {
+		req.Header[key] = value
+	}
+
+	httpClient := util.SetProxy(h.Cfg, &http.Client{})
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: fmt.Sprintf("Invalid request: %v", err),
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		defer func() {
+			if err = resp.Body.Close(); err != nil {
+				log.Printf("warn: failed to close response body: %v", err)
+			}
+		}()
+		bodyBytes, _ := io.ReadAll(resp.Body)
+
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: string(bodyBytes),
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
+
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	for key, value := range resp.Header {
+		c.Header(key, value[0])
+	}
+	output, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Errorf("Failed to read response body: %v", err)
+		return
+	}
+	c.Set("API_RESPONSE_TIMESTAMP", time.Now())
+	_, _ = c.Writer.Write(output)
+	c.Set("API_RESPONSE", output)
 }
 
 func (h *GeminiCLIAPIHandler) forwardCLIStream(c *gin.Context, flusher http.Flusher, alt string, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {

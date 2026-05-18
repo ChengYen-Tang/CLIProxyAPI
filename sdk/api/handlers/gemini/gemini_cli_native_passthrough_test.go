@@ -25,6 +25,12 @@ type nativePassthroughGeminiCLIExecutor struct {
 	streamCalls   int
 }
 
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
 func (e *nativePassthroughGeminiCLIExecutor) Identifier() string { return "gemini-cli" }
 
 func (e *nativePassthroughGeminiCLIExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
@@ -99,7 +105,135 @@ func TestGeminiCLIStreamGenerateContentNativePassthroughForwardsRawChunks(t *tes
 	assertGeminiCLINativePassthroughRequest(t, executor, body, "/v1internal:streamGenerateContent")
 }
 
+func TestGeminiCLIGenericInternalRouteUsesAuthReplacementWithNativePassthrough(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor, router := newGeminiCLINativePassthroughRouterWithConfig(t, "gemini-cli-generic-internal-model", &sdkconfig.SDKConfig{
+		EnableGeminiCLIEndpoint: true,
+		NativePassthrough:       true,
+		PassthroughHeaders:      true,
+	})
+
+	body := `{"operation":"quota"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1internal:retrieveUserQuota", strings.NewReader(body))
+	req.Host = "127.0.0.1"
+	req.RemoteAddr = "127.0.0.1:34567"
+	req.Header.Set("Authorization", "Bearer downstream-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body = %s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if strings.TrimSpace(resp.Body.String()) != `{"native":true}` {
+		t.Fatalf("response body = %q, want upstream body", strings.TrimSpace(resp.Body.String()))
+	}
+	assertGeminiCLINativePassthroughRequest(t, executor, body, "/v1internal:retrieveUserQuota")
+}
+
+func TestGeminiCLIGenericInternalRouteUsesAuthReplacementForLoadCodeAssist(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor, router := newGeminiCLINativePassthroughRouterWithConfig(t, "gemini-cli-generic-load-code-assist-model", &sdkconfig.SDKConfig{
+		EnableGeminiCLIEndpoint: true,
+		NativePassthrough:       true,
+		PassthroughHeaders:      true,
+	})
+
+	body := `{"operation":"bootstrap"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1internal:loadCodeAssist", strings.NewReader(body))
+	req.Host = "127.0.0.1"
+	req.RemoteAddr = "127.0.0.1:34567"
+	req.Header.Set("Authorization", "Bearer downstream-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body = %s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if strings.TrimSpace(resp.Body.String()) != `{"native":true}` {
+		t.Fatalf("response body = %q, want upstream body", strings.TrimSpace(resp.Body.String()))
+	}
+	assertGeminiCLINativePassthroughRequest(t, executor, body, "/v1internal:loadCodeAssist")
+}
+
+func TestGeminiCLIGenericInternalRouteFallsBackToLegacyForwardWhenNativePassthroughDisabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor, router := newGeminiCLINativePassthroughRouterWithConfig(t, "gemini-cli-generic-legacy-model", &sdkconfig.SDKConfig{
+		EnableGeminiCLIEndpoint: true,
+		NativePassthrough:       false,
+		PassthroughHeaders:      true,
+	})
+
+	var gotBody string
+	var gotAuth string
+	var gotPath string
+	oldDefaultTransport := http.DefaultTransport
+	http.DefaultTransport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		body, errRead := io.ReadAll(req.Body)
+		if errRead != nil {
+			t.Fatalf("ReadAll() error = %v", errRead)
+		}
+		gotBody = string(body)
+		gotAuth = req.Header.Get("Authorization")
+		gotPath = req.URL.String()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}, "X-Upstream": []string{"legacy"}},
+			Body:       io.NopCloser(strings.NewReader(`{"legacy":true}`)),
+		}, nil
+	})
+	t.Cleanup(func() {
+		http.DefaultTransport = oldDefaultTransport
+	})
+
+	body := `{"operation":"quota"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1internal:retrieveUserQuota", strings.NewReader(body))
+	req.Host = "127.0.0.1"
+	req.RemoteAddr = "127.0.0.1:34567"
+	req.Header.Set("Authorization", "Bearer downstream-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body = %s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if strings.TrimSpace(resp.Body.String()) != `{"legacy":true}` {
+		t.Fatalf("response body = %q, want legacy upstream body", strings.TrimSpace(resp.Body.String()))
+	}
+	if gotBody != body {
+		t.Fatalf("legacy upstream body = %q, want %q", gotBody, body)
+	}
+	if gotAuth != "Bearer downstream-token" {
+		t.Fatalf("legacy Authorization = %q, want downstream token", gotAuth)
+	}
+	if !strings.HasSuffix(gotPath, "/v1internal:retrieveUserQuota") {
+		t.Fatalf("legacy upstream URL = %q, want retrieveUserQuota suffix", gotPath)
+	}
+	if executor.executeCalls != 0 {
+		t.Fatalf("Execute calls = %d, want 0", executor.executeCalls)
+	}
+	if executor.streamCalls != 0 {
+		t.Fatalf("ExecuteStream calls = %d, want 0", executor.streamCalls)
+	}
+	if executor.authorization != "" || executor.url != "" || len(executor.body) != 0 {
+		t.Fatalf("native passthrough executor should not be used in legacy forward path")
+	}
+}
+
 func newGeminiCLINativePassthroughRouter(t *testing.T, model string) (*nativePassthroughGeminiCLIExecutor, *gin.Engine) {
+	return newGeminiCLINativePassthroughRouterWithConfig(t, model, &sdkconfig.SDKConfig{
+		EnableGeminiCLIEndpoint: true,
+		NativePassthrough:       true,
+		PassthroughHeaders:      true,
+	})
+}
+
+func newGeminiCLINativePassthroughRouterWithConfig(t *testing.T, model string, cfg *sdkconfig.SDKConfig) (*nativePassthroughGeminiCLIExecutor, *gin.Engine) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -129,11 +263,7 @@ func newGeminiCLINativePassthroughRouter(t *testing.T, model string) (*nativePas
 	})
 	manager.RefreshSchedulerEntry(auth.ID)
 
-	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{
-		EnableGeminiCLIEndpoint: true,
-		NativePassthrough:       true,
-		PassthroughHeaders:      true,
-	}, manager)
+	base := handlers.NewBaseAPIHandlers(cfg, manager)
 	handler := NewGeminiCLIAPIHandler(base)
 	router := gin.New()
 	router.POST("/v1internal:method", handler.CLIHandler)
